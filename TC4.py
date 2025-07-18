@@ -8,6 +8,8 @@
 input_video_path="/content/drive/MyDrive/Colab Notebooks/Unlocking Facial Recognition_ Diverse Activities Analysis.mp4"
 output_video_path_emotions="/content/output_video_emotions.mp4"
 output_video_path_pose="/content/output_video_pose.mp4"
+output_video_path_anomalies = "/content/output_video_anomalies.mp4"
+output_text_path_anomalies = "/content/output_text_anomalies.txt"
 output_text_path="/content/output_text.txt"
 output_audio_path="/content/output_audio.wav"
 output_text_path_sentences="/content/output_text_sentences.txt"
@@ -17,7 +19,6 @@ output_text_path_video_emotions="/content/output_text_path_video_emotions.txt"
 output_text_path_video_emotions_summarization="/content/output_text_path_video_emotions_summarization.txt"
 
 # Detecção de emoção
-
 import cv2
 from deepface import DeepFace
 import os
@@ -144,8 +145,195 @@ def detect_emotions(video_path, output_path):
 
 detect_emotions(input_video_path, output_video_path_emotions)
 
-# Detecção de pose
+#Detecção de Anomalias
+def detect_movement_anomalies(video_path, output_path, output_text_path_anomalies, sensitivity=0.15, window_size=10):
+    """
+    Detecta anomalias de movimento no vídeo analisando variações bruscas nas poses.
+    
+    Args:
+        video_path: Caminho para o vídeo de entrada
+        output_path: Caminho para o vídeo de saída com marcações de anomalias
+        output_text_path_anomalies: Caminho para o arquivo de texto com descrição das anomalias
+        sensitivity: Limiar de sensibilidade para detecção (0.05-0.2 recomendado)
+        window_size: Tamanho da janela para suavização de movimentos
+    """
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error opening video file")
+        return
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Armazenar histórico de landmarks para detectar movimentos bruscos
+    landmark_history = []
+    anomalies = []
+    
+    for frame_idx in tqdm(range(total_frames), desc="Detecting anomalies"):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(frame_rgb)
+        
+        # Visualizar pose
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            
+            # Extrair coordenadas dos landmarks principais
+            current_landmarks = []
+            for landmark in results.pose_landmarks.landmark:
+                current_landmarks.append((landmark.x, landmark.y, landmark.z))
+                
+            # Calcular velocidade de movimento se tivermos histórico suficiente
+            if len(landmark_history) > 0:
+                # Calcular variação média entre frames consecutivos
+                avg_movement = 0
+                prev_landmarks = landmark_history[-1]
+                
+                for i, (curr_x, curr_y, curr_z) in enumerate(current_landmarks):
+                    if i < len(prev_landmarks):
+                        prev_x, prev_y, prev_z = prev_landmarks[i]
+                        # Calcular distância euclidiana
+                        distance = ((curr_x - prev_x)**2 + (curr_y - prev_y)**2 + (curr_z - prev_z)**2)**0.5
+                        avg_movement += distance
+                
+                avg_movement /= len(current_landmarks)
+                
+                # Verificar se o movimento é anômalo
+                is_anomaly = False
+                if len(landmark_history) >= window_size:
+                    # Calcular média de movimento na janela recente
+                    window_movements = []
+                    for j in range(1, min(window_size, len(landmark_history))):
+                        window_prev = landmark_history[-j-1]
+                        window_curr = landmark_history[-j]
+                        window_movement = 0
+                        for i, (curr_x, curr_y, curr_z) in enumerate(window_curr):
+                            if i < len(window_prev):
+                                prev_x, prev_y, prev_z = window_prev[i]
+                                window_movement += ((curr_x - prev_x)**2 + (curr_y - prev_y)**2 + (curr_z - prev_z)**2)**0.5
+                        window_movement /= len(window_curr)
+                        window_movements.append(window_movement)
+                    
+                    avg_window_movement = sum(window_movements) / len(window_movements)
+                    
+                    # Detectar se o movimento atual é significativamente maior que a média recente
+                    if avg_movement > (avg_window_movement * (1 + sensitivity)) and avg_movement > 0.01:  # Limiar mínimo para ignorar pequenas variações
+                        is_anomaly = True
+                        anomalies.append({
+                            "frame": frame_idx,
+                            "timestamp": frame_idx / fps,
+                            "movement_intensity": avg_movement,
+                            "baseline_movement": avg_window_movement,
+                            "ratio": avg_movement / avg_window_movement
+                        })
+                        
+                        # Marcar anomalia no frame
+                        cv2.putText(frame, "ANOMALY DETECTED", (50, 50), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        # Adicionar borda vermelha
+                        cv2.rectangle(frame, (10, 10), (width-10, height-10), (0, 0, 255), 3)
+            
+            # Adicionar landmarks atuais ao histórico
+            landmark_history.append(current_landmarks)
+            # Limitar o tamanho do histórico
+            if len(landmark_history) > window_size:
+                landmark_history.pop(0)
+        
+        out.write(frame)
+    
+    cap.release()
+    out.release()
+    
+    # Agrupar anomalias próximas (dentro de 1 segundo)
+    grouped_anomalies = []
+    if anomalies:
+        current_group = [anomalies[0]]
+        for i in range(1, len(anomalies)):
+            if anomalies[i]["frame"] - current_group[-1]["frame"] <= fps:  # 1 segundo
+                current_group.append(anomalies[i])
+            else:
+                # Finalizar grupo atual
+                start_time = current_group[0]["timestamp"]
+                end_time = current_group[-1]["timestamp"]
+                max_intensity = max([a["ratio"] for a in current_group])
+                grouped_anomalies.append({
+                    "start_frame": current_group[0]["frame"],
+                    "end_frame": current_group[-1]["frame"],
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration": end_time - start_time,
+                    "max_intensity": max_intensity,
+                    "anomaly_count": len(current_group)
+                })
+                # Iniciar novo grupo
+                current_group = [anomalies[i]]
+        
+        # Adicionar último grupo
+        if current_group:
+            start_time = current_group[0]["timestamp"]
+            end_time = current_group[-1]["timestamp"]
+            max_intensity = max([a["ratio"] for a in current_group])
+            grouped_anomalies.append({
+                "start_frame": current_group[0]["frame"],
+                "end_frame": current_group[-1]["frame"],
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration": end_time - start_time,
+                "max_intensity": max_intensity,
+                "anomaly_count": len(current_group)
+            })
+    
+    # Escrever análise de anomalias
+    with open(output_text_path_anomalies, "w", encoding="utf-8") as f:
+        f.write("MOVEMENT ANOMALY ANALYSIS\n\n")
+        
+        if not grouped_anomalies:
+            f.write("No significant movement anomalies detected in the video.\n")
+        else:
+            f.write(f"Detected {len(grouped_anomalies)} anomaly events:\n\n")
+            
+            # Ordenar por intensidade
+            grouped_anomalies.sort(key=lambda x: x["max_intensity"], reverse=True)
+            
+            for i, anomaly in enumerate(grouped_anomalies):
+                severity = "High" if anomaly["max_intensity"] > 2.0 else ("Medium" if anomaly["max_intensity"] > 1.5 else "Low")
+                f.write(f"Anomaly {i+1} (Severity: {severity}):\n")
+                f.write(f"  Time: {anomaly['start_time']:.2f}s to {anomaly['end_time']:.2f}s (duration: {anomaly['duration']:.2f}s)\n")
+                f.write(f"  Frames: {anomaly['start_frame']} to {anomaly['end_frame']}\n")
+                f.write(f"  Movement intensity: {anomaly['max_intensity']:.2f}x normal\n")
+                f.write(f"  Consecutive anomalous frames: {anomaly['anomaly_count']}\n\n")
+            
+            # Adicionar estatísticas gerais
+            total_anomaly_time = sum([a["duration"] for a in grouped_anomalies])
+            total_video_time = total_frames / fps
+            anomaly_percentage = (total_anomaly_time / total_video_time) * 100
+            
+            f.write("\nSummary Statistics:\n")
+            f.write(f"Total video duration: {total_video_time:.2f} seconds\n")
+            f.write(f"Total time with anomalies: {total_anomaly_time:.2f} seconds ({anomaly_percentage:.1f}% of video)\n")
+            
+            # Classificar o vídeo baseado na presença de anomalias
+            if anomaly_percentage > 15:
+                f.write("\nAssessment: High level of anomalous movement detected throughout the video.\n")
+            elif anomaly_percentage > 5:
+                f.write("\nAssessment: Moderate level of anomalous movement detected in the video.\n")
+            else:
+                f.write("\nAssessment: Low level of anomalous movement detected, mostly normal activity patterns.\n")
+    
+    return anomalies
 
+# Detecção de Pose
 !pip install mediapipe
 
 import mediapipe as mp
@@ -191,8 +379,10 @@ def detect_pose(video_path, output_path):
 
 detect_pose(input_video_path, output_video_path_pose)
 
-#  Transcrição de áudio
+# Detecção de anomalias
+detect_movement_anomalies(input_video_path, output_video_path_anomalies, output_text_path_anomalies)
 
+#  Transcrição de áudio
 !pip install moviepy speechrecognition pydub
 !pip install deepmultilingualpunctuation
 
@@ -503,36 +693,96 @@ def create_narrative_chunks(data):
     
     return chunks
 
-def summarize_emotion_analysis(input_file_path, output_file_path, max_length=150):
+
+
+def summarize_emotion_analysis(input_file_path, output_file_path, anomalies_file_path=None, max_length=150):
     """
-    Função principal para resumir a análise de emoções.
+    Função principal para resumir a análise de emoções, agora com suporte para anomalias.
+    
+    Args:
+        input_file_path: Caminho para o arquivo de análise de emoções
+        output_file_path: Caminho para salvar o resumo gerado
+        anomalies_file_path: (Opcional) Caminho para o arquivo de análise de anomalias
+        max_length: Comprimento máximo para o resumo
     """
-    # Ler o arquivo de entrada
+    # Código original
     with open(input_file_path, "r", encoding="utf-8") as f:
         text = f.read()
     
-    # Extrair dados estruturados do texto
     data = extract_emotion_patterns(text)
-    
-    # Criar chunks narrativos
     narrative_chunks = create_narrative_chunks(data)
     
-    # Processar cada chunk narrativo
-    processed_chunks = []
+    # Adicionar informações de anomalias se disponível
+    if anomalies_file_path and os.path.exists(anomalies_file_path):
+        try:
+            with open(anomalies_file_path, "r", encoding="utf-8") as f:
+                anomalies_text = f.read()
+                
+            # Extrair informações de anomalias
+            anomaly_count_match = re.search(r"Detected (\d+) anomaly events:", anomalies_text)
+            anomaly_count = int(anomaly_count_match.group(1)) if anomaly_count_match else 0
+            
+            anomaly_percentage_match = re.search(r"Total time with anomalies: (\d+\.\d+) seconds \((\d+\.\d+)% of video\)", anomalies_text)
+            anomaly_percentage = float(anomaly_percentage_match.group(2)) if anomaly_percentage_match else 0
+            
+            assessment_match = re.search(r"Assessment: (.*?)\n", anomalies_text)
+            assessment = assessment_match.group(1) if assessment_match else "No assessment available"
+            
+            # Extrair as anomalias mais significativas
+            top_anomalies = []
+            anomaly_pattern = re.compile(r"Anomaly (\d+) \(Severity: (.*?)\):\n  Time: (\d+\.\d+)s to (\d+\.\d+)s.*?\n  Frames: (\d+) to (\d+)\n  Movement intensity: (\d+\.\d+)x", re.DOTALL)
+            for match in anomaly_pattern.finditer(anomalies_text):
+                _, severity, start_time, end_time, start_frame, end_frame, intensity = match.groups()
+                top_anomalies.append({
+                    "severity": severity,
+                    "start_time": float(start_time),
+                    "end_time": float(end_time),
+                    "start_frame": int(start_frame),
+                    "end_frame": int(end_frame),
+                    "intensity": float(intensity)
+                })
+            
+            # Limitar aos 5 principais
+            top_anomalies = sorted(top_anomalies, key=lambda x: x["intensity"], reverse=True)[:5]
+            
+            # Criar seção de anomalias
+            anomaly_section = "## Anomalias de Movimento Detectadas\n\n"
+            if anomaly_count > 0:
+                anomaly_section += f"Foram detectados {anomaly_count} eventos anômalos de movimento, ocupando {anomaly_percentage:.1f}% do tempo total do vídeo.\n\n"
+                anomaly_section += f"{assessment}\n\n"
+                
+                if top_anomalies:
+                    anomaly_section += "Principais anomalias detectadas:\n\n"
+                    for i, anomaly in enumerate(top_anomalies):
+                        anomaly_section += f"- **Anomalia {i+1} ({anomaly['severity']})**: Em {anomaly['start_time']:.1f}s-{anomaly['end_time']:.1f}s, "
+                        anomaly_section += f"intensidade {anomaly['intensity']:.1f}x acima do normal\n"
+            else:
+                anomaly_section += "Não foram detectadas anomalias significativas de movimento no vídeo. "
+                anomaly_section += "Os padrões de movimento observados estão dentro dos limites normais de variação."
+            
+            # Inserir a seção de anomalias após o terceiro chunk (após padrões e transições)
+            if len(narrative_chunks) >= 3:
+                narrative_chunks.insert(3, anomaly_section)
+            else:
+                narrative_chunks.append(anomaly_section)
+                
+        except Exception as e:
+            print(f"Erro ao processar arquivo de anomalias: {str(e)}")
+            # Continuar sem as informações de anomalias
     
+    # Resto do código original
+    processed_chunks = []
     for chunk in narrative_chunks:
-        # Verificar se o chunk precisa ser resumido
+        # ... (código existente para processamento de chunks)
         if len(chunk.split()) > 100:
             try:
                 # Aplicar o modelo de summarization apenas para chunks longos
                 result = summarizer(chunk, max_length=max_length, min_length=50, do_sample=False)
                 if result and len(result) > 0:
-                    # Preservar títulos de seção e formatar o resumo
                     title_match = re.search(r'^(#+\s.*?)$', chunk, re.MULTILINE)
                     title = title_match.group(1) if title_match else ""
                     
                     summary_text = result[0]["summary_text"]
-                    # Melhorar a formatação do resumo
                     summary_text = summary_text.replace(" . ", ". ")
                     summary_text = summary_text.replace(" , ", ", ")
                     
@@ -544,13 +794,17 @@ def summarize_emotion_analysis(input_file_path, output_file_path, max_length=150
                 print(f"Erro ao resumir chunk: {str(e)[:100]}...")
                 processed_chunks.append(chunk)
         else:
-            # Manter chunks curtos intactos
             processed_chunks.append(chunk)
     
-    # Adicionar conclusão
+    # Adicionar conclusão atualizada com menção a anomalias
     conclusion = "\n\n## Conclusão\n\n"
-    conclusion += "Esta análise emocional revela padrões significativos nas expressões faciais capturadas no vídeo. "
-    conclusion += "As transições entre diferentes estados emocionais fornecem insights sobre a dinâmica do conteúdo apresentado."
+    if anomalies_file_path and os.path.exists(anomalies_file_path):
+        conclusion += "Esta análise revela padrões significativos nas expressões faciais e movimentos capturados no vídeo. "
+        conclusion += "As transições entre diferentes estados emocionais, juntamente com a detecção de anomalias de movimento, "
+        conclusion += "fornecem insights valiosos sobre a dinâmica comportamental apresentada."
+    else:
+        conclusion += "Esta análise emocional revela padrões significativos nas expressões faciais capturadas no vídeo. "
+        conclusion += "As transições entre diferentes estados emocionais fornecem insights sobre a dinâmica do conteúdo apresentado."
     
     processed_chunks.append(conclusion)
     
@@ -572,37 +826,42 @@ def summarize_without_model(input_file_path, output_file_path):
     # Ler o arquivo de entrada
     with open(input_file_path, "r", encoding="utf-8") as f:
         text = f.read()
-    
+
     # Extrair dados estruturados do texto
     data = extract_emotion_patterns(text)
-    
+
     # Criar chunks narrativos (sem resumir)
     narrative_chunks = create_narrative_chunks(data)
-    
+
     # Combinar tudo em um texto final
     final_text = "\n\n".join(narrative_chunks)
-    
+
     # Adicionar conclusão
     conclusion = "\n\n## Conclusão\n\n"
     conclusion += "Esta análise emocional revela padrões significativos nas expressões faciais capturadas no vídeo. "
     conclusion += "As transições entre diferentes estados emocionais fornecem insights sobre a dinâmica do conteúdo apresentado."
-    
+
     final_text += conclusion
-    
+
     # Salvar o resultado
     with open(output_file_path, "w", encoding="utf-8") as f:
         f.write(final_text)
-    
+
     return final_text
 
 # Usando o modelo transformer (pode falhar com o erro de índice)
 try:
-    summarize_emotion_analysis("output_text_path_video_emotions.txt", 
-                              "output_text_path_video_emotions_summarization.txt")
+    summarize_emotion_analysis(
+        "output_text_path_video_emotions.txt",
+        "output_text_path_video_emotions_summarization.txt",
+        anomalies_file_path="output_text_anomalies.txt"
+    )
 except Exception as e:
     print(f"Erro ao usar o modelo transformer: {str(e)}")
     print("Usando método alternativo...")
     
     # Versão alternativa sem depender do modelo
-    summarize_without_model("output_text_path_video_emotions.txt", 
-                           "output_text_path_video_emotions_summarization.txt")
+    summarize_without_model(
+        "output_text_path_video_emotions.txt",
+        "output_text_path_video_emotions_summarization.txt"
+    )
